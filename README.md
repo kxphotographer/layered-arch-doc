@@ -1,29 +1,29 @@
-# Layered architecture idea of kxphotographer
+# Layered Architecture (kxphotographer)
 
-This repository stores my, kxphotographer's, idea of the layered architecture.
+This repository contains my view of a pragmatic layered architecture, distilled from Clean/Hexagonal principles and adapted for day-to-day application development.
 
 ---
 
 # Overview
 
-The project consists of the following layers:
+The project is organized into the following layers:
 
 - Runtime
 - Domain
-- User interface
-- Application (Use case)
+- User Interface
+- Application (Use Case)
 - Infrastructure
 
 ## Dependency rules
 
-- Runtime layer depends on implementation of user interface, application and infrastructure layers.
-- User interface, application and infrastructure layers depends on domain layer.
-- User interface layer's implementation depends on application port (interface).
-- Application layer implements application port defined in user interface layer.
-- Application layer's implementation depends on infrastructure layer port.
-- Infrastructure layer implements infrastructure port defined in application layer.
+- Runtime depends on the concrete implementations in the User Interface, Application, and Infrastructure layers.
+- User Interface, Application, and Infrastructure depend on the Domain layer (never the other way around).
+- The User Interface layer depends on the Application port (interface) — not a concrete implementation.
+- The Application layer implements the Application port defined by the User Interface layer.
+- The Application layer depends on Infrastructure ports (interfaces) defined within the Application layer.
+- The Infrastructure layer implements the Infrastructure ports defined by the Application layer.
 
-When the whole implementation is run as an application, implementation in the user interface layer calls a function in the application layer, and implementation in the application layer calls a function in the infrastructure layer as a result, but actually implementations just depend on ports (or interfaces) defined in the same layer, and the lower layer implements them. So the actual direction of the dependencies are infrastructure layer to application layer, and application layer to user interface layer. This is because the [dependency inversion principal](https://en.wikipedia.org/wiki/Dependency_inversion_principle) is applied.
+When the application runs end-to-end, the User Interface calls into the Application layer, and the Application layer calls into Infrastructure. However, compile-time dependencies point inward via ports (interfaces): lower-level details implement ports defined by higher-level policies. In other words, concrete Infrastructure depends on Application-defined ports, and concrete Application implementations depend on User-Interface-defined ports. This is a deliberate application of the [Dependency Inversion Principle](https://en.wikipedia.org/wiki/Dependency_inversion_principle).
 
 ```mermaid
 graph LR
@@ -32,7 +32,7 @@ subgraph "Runtime layer"
     E["Application entrypoint"]
 end
 
-subgraph "User interface layer"
+subgraph "User Interface layer"
     Ui["Implementation"]
     Ap["Application port<br>(interface)"]
 end
@@ -77,42 +77,81 @@ De --> Dv
 
 # Runtime layer
 
-This layer contains one or more entry point scripts to run the app. A script is responsible to instantiate instances from user interface, application and infrastructure layers resolving their dependencies so that implementation of the whole project runs as an application.
+This layer contains one or more entry point scripts that wire the application together. An entry point is responsible for instantiating concrete implementations from the User Interface, Application, and Infrastructure layers and resolving their dependencies so the whole system can run.
+
+Typical responsibilities:
+- Choose concrete adapters (e.g., which database implementation, which message bus client)
+- Configure dependency injection or manual wiring
+- Load configuration (env vars, CLI args)
+- Start servers, workers, schedulers
 
 ---
 
 # Domain layer
 
-This layer defines data: more specifically, how a value can be, what attributes a unit of data have, and what a consistent state is, in terms of the business the application covers.
+This layer defines the core business concepts and their rules. It captures:
+- What values are valid and how they can change
+- Which attributes a business concept has
+- What constitutes a consistent state
+
+Common building blocks:
+- Aggregates: clusters of domain objects treated as a consistency boundary
+- Entities: identifiable objects that change over time
+- Value Objects: immutable values defined by their properties (can be branded/opaque types)
+
+The Domain layer is pure and has no dependencies on other layers. It should be easy to unit test in isolation.
 
 ---
 
-# User interface layer
+# User Interface layer
 
-This layer is responsible for calling a function of the application layer converting/validating user input into values defined in the domain layer, and display output of the application layer function's result to the user. Here, "user" does not necessarily mean a human; it can be a web browser, a mobile app, a remote server etc.
+This layer adapts the outside world to the Application layer. It:
+- Accepts input, validates and converts it into Domain types
+- Invokes Application use cases via the Application port
+- Presents results back to the caller (HTTP response, CLI output, RPC reply, etc.)
 
-This layer also defines ports (or interfaces) for application layer, which should implement them.
+“User” is broad: it can be a browser, mobile app, CLI, cron job, or another service. This layer also defines the Application port (interfaces) that the Application layer must implement. That lets the UI depend only on behavior contracts, not concrete implementations.
 
 ---
 
-# Application (Use case) layer
+# Application (Use Case) layer
 
-This layer is responsible to orchestrate data using domain objects and functions of infrastructure layer as requested by user interface layer.
+This layer implements use cases and orchestrates the domain model and infrastructure through ports. It:
+- Implements the Application port consumed by the User Interface layer
+- Defines Infrastructure ports that express what it needs from external systems
+- Coordinates domain objects and enforces application-specific policies (idempotence, permissions, invariants across aggregates)
+- Establishes transaction boundaries without leaking technology choices
 
-This layer also defines ports for infrastructure layer, which should implement them.
-
-This layer should be able to decide the boundary of atomicity, in other word, the range of transaction, without depending on the concrete technology used in the infrastructure. Therefore, this layer should also define a port for the transaction wrapper, and infrastructure layer should implement it.
+Because the Application layer defines its own Infrastructure ports, it can decide transactional boundaries and error semantics independent of the actual database or external services. The Infrastructure layer provides concrete adapters that implement these ports.
 
 ```ts
-// Example of transaction wrapper type in TypeScript
-type TransactionWrapper<TransactionType> =
-    <const CallbackResult extends { commit: boolean }>(
-        callback: (transaction: TransactionType) => CallbackResult,
-    ) => CallbackResult;
+// Example: technology-agnostic transaction function type in TypeScript
+// The Application layer defines this; Infrastructure implements it.
+export type TransactionFunction<TransactionHandle> = <Result>(
+  action: (tx: TransactionHandle) => Promise<Result>
+) => Promise<Result>;
 ```
 
 ---
 
 # Infrastructure layer
 
-This layer is responsible to communicate with concrete external resources such as a relational database, an in-memory key-value store, an object storage, an external API, and so on, converting data from/to that defined in the domain layer. This layer should implement the infrastructure ports defined in the application layer.
+This layer communicates with external systems (databases, caches, object stores, external APIs, queues) and maps data to/from Domain types. It implements the Infrastructure ports defined in the Application layer and must not leak technology-specific details upward.
+
+Typical responsibilities:
+- Implement repositories, gateways, and transaction functions
+- Handle retries, timeouts, circuit breakers at the edge
+- Translate infrastructure errors into Application-level error types
+
+Note: Infrastructure depends inward on the Domain and on the ports defined by the Application layer; the Domain never depends on Infrastructure.
+
+---
+
+# Putting it together: data flow example
+
+1) A request reaches the User Interface (e.g., HTTP controller). It validates input and converts it to Domain types.
+2) The UI calls the Application port (use case method) with the validated data.
+3) The Application layer starts a transaction (via its transaction port), loads aggregates through repository ports, applies domain logic, and persists changes.
+4) The Application returns a result DTO. The UI formats it for the caller.
+
+This separation keeps business rules testable and stable even as frameworks, databases, or protocols change.
